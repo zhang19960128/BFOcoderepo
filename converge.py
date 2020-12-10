@@ -16,6 +16,9 @@ class Eenthalpy():
         self.basefile=path+'/'+base;
         self.obtainvol();
         self.natoms=natoms;
+        self.atommass=np.zeros(natoms);
+        self.edie=np.zeros([3,3]);
+        self.atomcharge=np.zeros([natoms,3,3]);
     def obtainvol(self):
         f=open(self.scffile,'r');
         lines=f.readlines();
@@ -26,40 +29,135 @@ class Eenthalpy():
             if lines[i].find("CELL_PARAMETERS")!=-1:
                 for j in range(3):
                     for k in range(3):
-                        self.axis[j][k]=float(lines[i+j+1].split()[k])/atoau;
+                        self.axis[j][k]=float(lines[i+j+1].split()[k]);
         f.close();
-    def obtaindipole(self,file):
-        f=open(file,'r');
-        lines=f.readlines();
-        length=len(lines);
-        edipole=np.zeros(3);
-        idipole=np.zeros(3);
-        dipoles=np.zeros([2,3]);
-        for i in range(length):
+    def obtainph(self,file):
+        phout=open(file,'r');
+        #post-processing ph.out
+        lines=phout.readlines();
+        for i in range(len(lines)):
+            if lines[i].find("site n.  atom      mass           positions (alat units)")!=-1:
+                for j in range(self.natoms):
+                    for k in range(3):
+                        self.atommass[j]=float(lines[i+j+1].split()[2]);
+            if lines[i].find("Dielectric constant in cartesian axis")!=-1:
+                for j in range(3):
+                    for k in range(3):
+                        self.edie[j][k]=float(lines[i+j+2].split()[k+1]);
+            if lines[i].find("Effective charges (d P / du) in cartesian axis")!=-1:
+                for j in range(self.natoms):
+                    for k in range(3):
+                        for m in range(3):
+                            self.atomcharge[j][k][m]=lines[i+2+4*j+k+1].split()[m+2];
+        phout.close();
+    def obtaindipolescftotal(self,file):
+        berryout=open(file,'r');
+        lines=berryout.readlines();
+        epolar=np.zeros(3);
+        apolar=np.zeros(3);
+        total=np.zeros(3);
+        Atoau=0.52917721067121;
+        for i in range(len(lines)):
             if(lines[i].find("Electronic Dipole on Cartesian axes")!=-1):
                 for j in range(3):
-                    edipole[j]=float(lines[i+j+1].split()[1]);
-            if(lines[i].find("Ionic Dipole on Cartesian axes")!=-1):
+                    epolar[j]=float(lines[i+1+j].split()[1])/math.sqrt(2);
+            elif(lines[i].find("Ionic Dipole on Cartesian axes")!=-1):
                 for j in range(3):
-                    idipole[j]=float(lines[i+j+1].split()[1]);
-        dipoles[0][0:3]=np.copy(edipole*1.0/math.sqrt(2));
-        dipoles[1][0:3]=np.copy(idipole*1.0/math.sqrt(2));
-        return dipoles;
-    def convergeP(self,filelist):
-        length=len(filelist);
-        edipolelist=np.zeros([length,3]);
-        idipolelist=np.zeros([length,3]);
-        tpdipolelist=np.zeros([length,3]);
-        referdip=self.obtaindipole(self.basefile);
+                    apolar[j]=float(lines[i+1+j].split()[1])/math.sqrt(2);
+        return[epolar,apolar];
+    def readposition(self,scfin,natoms):
+        scfinput=open(scfin,'r');
+        lines=scfinput.readlines();
+        length=len(lines);
+        atomp=np.zeros([natoms,3]);
         for i in range(length):
-            dip=self.obtaindipole(filelist[i]);
-            edipolelist[i][0:3]=dip[0,0:3]-referdip[0,0:3];
-            idipolelist[i][0:3]=dip[1,0:3]-referdip[1,0:3];
-            tpdipolelist[i][0:3]=(edipolelist[i,0:3]+idipolelist[i,0:3])/np.linalg.det(self.axis)*57.137;
-        matplotlib.rc('font',size=20)
-        plt.plot(range(length),tpdipolelist[:,2],marker='o',markersize=5,Linewidth=2);
-        plt.xlabel("iteration #");
-        plt.ylabel("$\Delta P_{z}$");
+            if lines[i].find("ATOMIC_POSITIONS")!=-1 and lines[i].find("(angstrom)")!=-1:
+                for j in range(natoms):
+                    for k in range(3):
+                        atomp[j,k]=float(lines[i+j+1].split()[k+1]);
+        return atomp;
+    def obtaindipolediffperiod(self,pscfin,pscfout,ascfin,ascfout):
+        # this function is the function used to calibrate the periodical effects of berry phase:
+        print("====================================================");
+        Atoau=0.52917721067121;
+        previous=self.obtaindipolescftotal(pscfout);
+        now=self.obtaindipolescftotal(ascfout);
+        period=np.zeros(3);
+        for i in range(3):
+            period[i]=self.axis[i][i]/Atoau;
+        deltae=np.zeros(3);
+        deltai=np.zeros(3);
+        for i in range(3):
+            deltae[i]=now[0][i]-previous[0][i];
+            deltai[i]=now[1][i]-previous[1][i];
+        f=open(pscfin,'r');
+        lines=f.readlines();
+        f.close();
+        ebefore=np.zeros(3);
+        eafter=np.zeros(3);
+        for i in range(len(lines)):
+            for j in range(3):
+                if lines[i].find("efield_cart("+str(j+1)+")")!=-1:
+                    ebefore[j]=float(lines[i].split("=")[-1]);
+        f=open(ascfin,'r');
+        lines=f.readlines();
+        f.close();
+        for i in range(len(lines)):
+            for j in range(3):
+                if lines[i].find("efield_cart("+str(j+1)+")")!=-1:
+                    eafter[j]=float(lines[i].split("=")[-1]);
+        diffe=eafter-ebefore;
+        # estimate the electrical polarization change;
+        epsilzero=8.8541878*10**-12;
+        angstrom=10**-10;
+        efieldqe=36.3609*10**10;
+        echarge=1.60217662*10**-19;
+        au=0.529*10**-10;
+        dipoleqe=epsilzero*angstrom**3*efieldqe/echarge/au;
+        polarest=np.matmul(self.edie,diffe)*np.linalg.det(self.axis)*dipoleqe;# units e*au;
+        print("estimate electric dipole change: by suseptbility ",polarest,'QE output: ',deltae);
+        for i in range(3):
+            deltae[i]=deltae[i]-round(deltae[i]/period[i])*period[i];
+            temp=period[i]*(round(polarest[i]/period[i])-round(deltae[i]/period[i]));
+            deltae[i]=deltae[i]+temp;
+        print("QE output: ",deltae,"Period: ",period);
+        #estimate the ioninc polarization change;
+        atombefore=self.readposition(pscfin,self.natoms);
+        atomafter=self.readposition(ascfin,self.natoms);
+        diffp=atomafter-atombefore;
+        dipolestp=np.zeros(3);
+        for i in range(self.natoms):
+            dipolestp=dipolestp+np.matmul(self.atomcharge[i,0:3,0:3],diffp[i])/0.529;
+        print("estimate ionic dipole change: by Born effective charge: ",dipolestp,'QE ouput',deltai);
+        for i in range(3):
+            deltai[i]=deltai[i]-round(deltai[i]/period[i])*period[i];
+            temp=period[i]*(round(dipolestp[i]/period[i])-round(deltai[i]/period[i]));
+            deltai[i]=deltai[i]+temp;
+        print("QE output: ",deltai,"Period: ",period);
+        print("====================================================");
+        return [deltae/np.linalg.det(self.axis/Atoau),deltai/np.linalg.det(self.axis/Atoau)];
+    def convergeP(self,scfinlist,scfoutlist,phlist):
+        length=len(scfinlist);
+        delpolare=np.zeros([length,3]);
+        delpolari=np.zeros([length,3]);
+        total=np.zeros([length,3]);
+        for i in range(1,length):
+            self.obtainph(phlist[i]);
+            re=self.obtaindipolediffperiod(scfinlist[i-1],scfoutlist[i-1],scfinlist[i],scfoutlist[i]);
+            delpolare[i,0:3]=np.copy(re[0]);
+            delpolari[i,0:3]=np.copy(re[1]);
+            for j in range(i+1):
+                total[i,0:3]=delpolare[j,0:3]+delpolari[j,0:3]+total[i,0:3];
+            total[i,0:3]=57.2148*total[i,0:3];
+        print(total)
+        matplotlib.rc('font',size=20);
+        plt.plot(range(length),total[:,0],marker=7,markersize=10);
+        plt.plot(range(length),total[:,1],marker='X',markersize=10);
+        plt.plot(range(length),total[:,2],marker=4,markersize=10);
+        plt.ylim([-0.10,0.05])
+        plt.legend(["Px","Py","Pz"])
+        plt.xlabel("iteration #")
+        plt.ylabel("Polarization (C/$m^2$)")
     def obtainforce(self,file): 
         # post-processing the scf.out
         scfout=open(file,'r');
@@ -90,28 +188,10 @@ class Eenthalpy():
         plt.plot(range(length),norm,marker='o',markersize=5,Linewidth=2);
         plt.xlabel("iteration #");
         plt.ylabel("$|F_{max}|(Ry/au)$");        
-    def scan(self,estep):
-        length=len(estep);
-        edipole=np.zeros([length,3]);
-        idipole=np.zeros([length,3]);
-        totaldipole=np.zeros([length,3]);
-        totalpolar=np.zeros([length,3]);
-        symdipole=self.obtaindipole(self.path+'/'+'bfoE'+'0.0'+'.out');
-        for i in range(length):
-            dip=self.obtaindipole(self.path+'/'+'bfoE'+"{:3.1f}".format(estep[i])+'.out');
-            edipole[i,0:3]=dip[0][0:3]-symdipole[0][0:3];
-            idipole[i,0:3]=dip[1][0:3]-symdipole[1][0:3];
-            totaldipole[i,0:3]=edipole[i,0:3]+idipole[i,0:3];
-            totalpolar[i,0:3]=totaldipole[i,0:3]/np.linalg.det(self.axis)*57.137;
-        plt.plot(estep,totalpolar[:,0],marker='o',markersize=4,Linewidth=2)
-        plt.plot(estep,totalpolar[:,1],marker='s',markersize=4,Linewidth=2)
-        plt.plot(estep,totalpolar[:,2],marker='1',markersize=4,Linewidth=2)
-        plt.legend(["px","py",'pz'])
-        plt.xlabel("Ez(mv/cm)")
-        plt.xlim([-2.0,2.0])
-        plt.ylabel('Change of Polarization(c/m^2)')
-        matplotlib.rc('font',size=20)
-en=Eenthalpy(5,'.','./PWOUT/bto.in','./PWOUT/ite.out0');
-flist=["./PWOUT/ite.out"+str(i) for i in range(7)];
-#en.convergeP(flist)
-en.convergeF(flist)
+en=Eenthalpy(5,'.','./PWOUT/ite0','./PWOUT/ite.out0');
+iten=6;
+scfinlist=["./PWOUT/ite.out"+str(i) for i in range(iten)];
+scfoutlist=["./PWOUT/ite.out"+str(i) for i in range(iten)];
+phlist=["./PWOUT/ph.out"+str(i) for i in range(iten)];
+en.convergeP(scfinlist,scfoutlist,phlist)
+#en.convergeF(flist)
