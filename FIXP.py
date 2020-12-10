@@ -90,8 +90,83 @@ class pwout:
         for i in range(3):
             total[i]=epolar[i]+apolar[i];
         # now the units of dipole is e * bohr   
-        print('the polarization now is: ',total/np.linalg.det(self.axis/Atoau))
+        print('the polarization now is: ',total/np.linalg.det(self.axis/Atoau)*57.137)
         return total/np.linalg.det(self.axis/Atoau);
+    def obtaindipolescftotal(self,file):
+        berryout=open(file,'r');
+        lines=berryout.readlines();
+        epolar=np.zeros(3);
+        apolar=np.zeros(3);
+        total=np.zeros(3);
+        Atoau=0.52917721067121;
+        for i in range(len(lines)):
+            if(lines[i].find("Electronic Dipole on Cartesian axes")!=-1):
+                for j in range(3):
+                    epolar[j]=float(lines[i+1+j].split()[1])/math.sqrt(2);
+            elif(lines[i].find("Ionic Dipole on Cartesian axes")!=-1):
+                for j in range(3):
+                    apolar[j]=float(lines[i+1+j].split()[1])/math.sqrt(2);
+        return[epolar,apolar];
+    def obtaindipolediffperiod(self,pscfin,pscfout,ascfin,ascfout):
+        # this function is the function used to calibrate the periodical effects of berry phase:
+        print("====================================================");
+        Atoau=0.52917721067121;
+        previous=self.obtaindipolescftotal(pscfout);
+        now=self.obtaindipolescftotal(ascfout);
+        period=np.zeros(3);
+        for i in range(3):
+            period[i]=self.axis[i][i]/Atoau;
+        deltae=np.zeros(3);
+        deltai=np.zeros(3);
+        for i in range(3):
+            deltae[i]=now[0][i]-previous[0][i];
+            deltai[i]=now[1][i]-previous[1][i];
+        f=open(pscfin,'r');
+        lines=f.readlines();
+        f.close();
+        ebefore=np.zeros(3);
+        eafter=np.zeros(3);
+        for i in range(len(lines)):
+            for j in range(3):
+                if lines[i].find("efield_cart("+str(j+1)+")")!=-1:
+                    ebefore[j]=float(lines[i].split("=")[-1]);
+        f=open(ascfin,'r');
+        lines=f.readlines();
+        f.close();
+        for i in range(len(lines)):
+            for j in range(3):
+                if lines[i].find("efield_cart("+str(j+1)+")")!=-1:
+                    eafter[j]=float(lines[i].split("=")[-1]);
+        diffe=eafter-ebefore;
+        # estimate the electrical polarization change;
+        epsilzero=8.8541878*10**-12;
+        angstrom=10**-10;
+        efieldqe=36.3609*10**10;
+        echarge=1.60217662*10**-19;
+        au=0.529*10**-10;
+        dipoleqe=epsilzero*angstrom**3*efieldqe/echarge/au;
+        polarest=np.matmul(self.edie,diffe)*np.linalg.det(self.axis)*dipoleqe;# units e*au;
+        print("estimate electric dipole change: by suseptbility ",polarest,'QE output: ',deltae);
+        for i in range(3):
+            deltae[i]=deltae[i]-round(deltae[i]/period[i])*period[i];
+            temp=period[i]*(round(polarest[i]/period[i])-round(deltae[i]/period[i]));
+            deltae[i]=deltae[i]+temp;
+        print("QE output: ",deltae,"Period: ",period);
+        #estimate the ioninc polarization change;
+        atombefore=self.readposition(pscfin,self.natoms);
+        atomafter=self.readposition(ascfin,self.natoms);
+        diffp=atomafter-atombefore;
+        dipolestp=np.zeros(3);
+        for i in range(self.natoms):
+            dipolestp=dipolestp+np.matmul(self.atomcharge[i,0:3,0:3],diffp[i])/0.529;
+        print("estimate ionic dipole change: by Born effective charge: ",dipolestp,'QE ouput',deltai);
+        for i in range(3):
+            deltai[i]=deltai[i]-round(deltai[i]/period[i])*period[i];
+            temp=period[i]*(round(dipolestp[i]/period[i])-round(deltai[i]/period[i]));
+            deltai[i]=deltai[i]+temp;
+        print("QE output: ",deltai,"Period: ",period);
+        print("====================================================");
+        return [deltae/np.linalg.det(self.axis/Atoau),deltai/np.linalg.det(self.axis/Atoau)];
     def readscf(self):
         scfinput=open(self.scfin,'r');
         lines=scfinput.readlines();
@@ -105,6 +180,17 @@ class pwout:
                 for j in range(self.natoms):
                     for k in range(3):
                         self.atomp[j,k]=float(lines[i+j+1].split()[k+1]);
+    def readposition(self,scfin,natoms):
+        scfinput=open(scfin,'r');
+        lines=scfinput.readlines();
+        length=len(lines);
+        atomp=np.zeros([natoms,3]);
+        for i in range(length):
+            if lines[i].find("ATOMIC_POSITIONS")!=-1 and lines[i].find("(angstrom)")!=-1:
+                for j in range(natoms):
+                    for k in range(3):
+                        atomp[j,k]=float(lines[i+j+1].split()[k+1]);
+        return atomp;
     def writenewscf(self,Efield,atomposition,filename):
         # the Efield units now is MV/cm
         # the atomposition units is the angstrom;
@@ -146,7 +232,11 @@ class pwout:
         lines=scffiles.readlines();
         tick1=0;
         tick2=0;
+        skiplines=0;
         for i in range(len(lines)):
+            if skiplines >0:
+                skiplines=skiplines-1;
+                continue;
             if lines[i].find("efield_cart")!=-1:
                 continue;
             elif lines[i].find("lelfield")!=-1:
@@ -159,65 +249,50 @@ class pwout:
                     for t in range(3):
                         temp=temp+'{:12.8f}'.format(atomposition[j,t]);
                     newfilename.write(lines[j+i+1].split()[0]+" "+temp+'\n');
+            elif lines[i].find("K_POINTS")!=-1:
+                newfilename.write("K_POINTS automatic\n");
+                newfilename.write("4 4 4 1 1 1\n")
+                skiplines=1;
             elif tick2+self.natoms >= i and tick2 >1:
                 continue;
             else:
                 newfilename.write(lines[i]);
         newfilename.close();
         scffiles.close();        
-    def iterate(self,times,step):
-        startP=self.obtaindipolescf(self.zerofile); #units e/bohr^2;
-        endP=startP+np.array([0,0,1])*step/57.137;#units e/bohr^2;step units is C/m^2
-        deltaP=startP-endP;
-        print('the aim is: ',endP,'Please also be notifying that forces should also be zero');
-        self.obtainph(self.phfile);
-        self.obtaindyn(self.dynfile);
-        # starting the first guess: think the polarization increase partly come from the electrical contribution
-        efield=np.matmul(-1*np.linalg.inv(self.edie*self.vol),deltaP*self.vol)/0.0000154961;
-        efield=efield*1.0;#only count as 10% from the electrical contribution, the first step.
-        print('electrical field=',efield)
-        au=0.52917721067121;
-        self.writenewscf(efield,self.atomp,"ite1");
-        self.writenewscfnoe(self.atomp,"itenoe1");
-        for i in range(1,times):
-            self.obtainforce(self.path+'/'+'ite.out'+str(i));
-            Pnow=self.obtaindipolescf(self.path+'/'+'ite.out'+str(i));
-            self.obtainph(self.path+'/'+'ph.out'+str(i));
-            self.obtaindyn(self.path+'/'+'dyn.out'+str(i));
-            deltaP=Pnow-endP;
-            deltax=self.solve(self.force,deltaP);
-            posit=au*np.reshape(deltax[0:self.natoms*3],[self.natoms,3]);
-            posit=posit+self.atomp;
-            self.writenewscf(deltax[self.natoms*3:(self.natoms+1)*3],posit,'ite'+str(i+1));
-            self.writenewscfnoe(posit, 'itenoe'+str(i+1));
     def iteratetwo(self,times,step):
         startP=self.obtaindipolescf(self.zerofile); #units e/bohr^2;
         endP=startP+np.array([0,0,1])*step/57.137;#units e/bohr^2;step units is C/m^2
         deltaP=startP-endP;
-        print('the aim is: ',endP,'Please also be notifying that forces should also be zero');
+        print('the aim is: ',endP*57.137,'Please also be notifying that forces should also be zero');
         self.obtainph(self.phfile);
         self.obtaindyn(self.dynfile);
-        # starting the first guess: think the polarization increase partly come from the electrical contribution
+        # starting the first guess: th  ink the polarization increase partly come from the electrical contribution
         efield=np.matmul(-1*np.linalg.inv(self.edie*self.vol),deltaP*self.vol)/0.0000154961;
         efieldzero=efield*1.0;#only count as 10% from the electrical contribution, the first step.
-        print('electrical zero field=',efieldzero)
         au=0.52917721067121;
         self.writenewscf(efield,self.atomp,"ite1");
         self.writenewscfnoe(self.atomp,"itenoe1");
         accup=np.zeros([self.natoms,3])
         accue=np.zeros(3);
+        accupolar=[np.zeros(3),np.zeros(3)];
         for i in range(1,times):
             self.obtainforce(self.path+'/'+'ite.out'+str(i));
-            Pnow=self.obtaindipolescf(self.path+'/'+'ite.out'+str(i));
-            self.obtainph(self.path+'/'+'ph.out'+str(i));
-            self.obtaindyn(self.path+'/'+'dyn.out'+str(i));
-            deltaP=Pnow-endP;
+            scfbefore=self.path+'/'+'ite'+str(i-1);
+            scfafter=self.path+'/'+'ite'+str(i);
+            scfbeforeout=self.path+'/'+'ite.out'+str(i-1);
+            scfafterout=self.path+'/'+'ite.out'+str(i);
+            diffp=self.obtaindipolediffperiod(scfbefore,scfbeforeout,scfafter,scfafterout);
+            accupolar[0]=accupolar[0]+diffp[0];
+            accupolar[1]=accupolar[1]+diffp[1];
+#            self.obtainph(self.path+'/'+'ph.out'+str(i));
+#            self.obtaindyn(self.path+'/'+'dyn.out'+str(i));
+            deltaP=accupolar[0]+accupolar[1]+startP-endP;
+            print("The polarization difference is:(C/m^2) ",deltaP*57.137)
             deltax=self.solve(self.force,deltaP);
             accup=accup+au*np.reshape(deltax[0:self.natoms*3],[self.natoms,3]);
-            posit=accup+self.atomp;
             accue=accue+deltax[self.natoms*3:(self.natoms+1)*3];
+            posit=accup+self.atomp;
             efield=accue+efieldzero;
-            print('deltaE=',deltax[self.natoms*3:(self.natoms+1)*3],'accue=',efield)
             self.writenewscf(efield,posit,'ite'+str(i+1));
             self.writenewscfnoe(posit, 'itenoe'+str(i+1));
     def solve(self,force,deltaP):
@@ -241,6 +316,6 @@ class pwout:
         self.y[3*self.natoms+2]=self.vol*deltaP[2];
         self.x=np.matmul(np.linalg.inv(self.A),self.y);
         return np.matmul(np.linalg.inv(self.A),self.y);
-pw=pwout("./PWOUT","ph.out1",'bto.dyn1','btozero.out','bto.in');
-pw.obtain(5);
-pw.iteratetwo(int(sys.argv[1]),    float(sys.argv[2]));
+pw=pwout("./PWOUT","ph.out0",'bfo.dyn0','ite.out0','bfo.in');
+pw.obtain(20);
+pw.iteratetwo(int(sys.argv[1]),float(sys.argv[2]));
